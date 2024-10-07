@@ -1,0 +1,18 @@
+Package: TDAParallelPatch
+Title: A patch for running the TDA in a parallel way.
+Version: 0.0.0.9000
+Authors@R: 
+    person("Cover", "Wu", , "cover.wu@foxmail.com", role = c("aut", "cre"),
+           comment = c(ORCID = "YOUR-ORCID-ID"))
+Description: I am too tired to describe what's the aim of the package...
+License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
+        license
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.1.2
+Imports: TDA, parallel
+NeedsCompilation: no
+Packaged: 2022-10-05 12:56:15 UTC; Cover
+Author: Cover Wu [aut, cre] (YOUR-ORCID-ID)
+Maintainer: Cover Wu <cover.wu@foxmail.com>
+Built: R 4.2.1; ; 2022-10-05 12:56:29 UTC; windows
