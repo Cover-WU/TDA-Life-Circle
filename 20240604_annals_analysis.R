@@ -32,7 +32,7 @@ crs.utm <- CRS("+init=epsg:32650")
 crs.wgs <- CRS("+proj=longlat +datum=WGS84")
 
 # bootstrapping times and confidence level
-B <- 300; alpha=0.05
+B <- 300; alpha <- 0.05
 
 # set the surplus
 SurplusConstant <- pi / 3 # the unit: cubic kilometers.
@@ -72,6 +72,15 @@ read.func <- function(filename){
 
 location <- map(full.list, read.func)
 location.names <- full.list %>% sapply(function(x) gsub('.csv', '', x))
+
+# count the number of community users recorded
+count.residents <- function(filename){
+  full.path <- paste(file.path, filename, sep = '/')
+  counts <- read_csv(full.path, col_types = cols(t_start=col_datetime(), t_end=col_datetime())) %>% 
+    .$pid %>% unique() %>% length()
+  return(counts)
+}
+residents.count <- map_dbl(full.list, count.residents)
 
 # convert data frame to spatial data frame
 convert2SpDf <- function(data){
@@ -116,7 +125,6 @@ batchPartition <- function(datamat, batch.size = BatchSize, random.seed = 5){
   return(list(batches=batches, weight=weight))
 }
 
-
 # find one topological component at one valley in DTM topography.
 fluidTopoCup <- function(rasteri, thres, minCellID){
   # subset the area above a distance threshold.
@@ -144,7 +152,6 @@ atVolume <- function(raster.cut.component, Target){
   judge <- integ.std <= Target
   return(judge)
 }
-
 
 # create Morse-Smale complex to partition the ascending manifolds
 MorseSmaleComplexSeg <- function(rasteri, siglevel){
@@ -228,7 +235,7 @@ searchOneSmallCup <- function(rasteri, Target, cellID){
 searchManySmallCups <- function(rasteri, Target, cellID){
   while (TRUE) {
     # initialized theta parameters
-    theta <- rasteri[cellID] + 0.01
+    theta <- rasteri[cellID] + 0
     # optimized parameters by optimizer
     optimParams <- thresOptimLagrange(rasteri, theta, cellID, Target)
     # return a combined raster with multiple parts.
@@ -593,13 +600,13 @@ Coarse2Fine <- function(raster.city, i, act.cloud, m.o, weight){
                         location = TRUE, printProgress=TRUE, m0=m.o, weight=weight.vec)
   
   # bands on the zero and first dimension
-  band0 <- bootstrapDiagramBig(location.subcloud, dtm, lim, by=resolution, maxdimension = 1, B=B, 
-                               alpha=alpha, dimension=0, parallel=T, weight=weight.boot,
-                               printProgress = T, m0=m.o, isLinux = is.Linux)
+  band0 <- bootstrapDiagram(location.subcloud, dtm, lim, by=resolution, maxdimension = 1, B=B, 
+                            alpha=alpha, dimension=0, parallel=T, weight=weight.boot,
+                            printProgress = T, m0=m.o)
   gc()
-  band1 <- bootstrapDiagramBig(location.subcloud, dtm, lim, by=resolution, maxdimension = 1, B=B, 
-                               alpha=alpha, dimension=1, parallel=T, weight=weight.boot,
-                               printProgress = T, m0=m.o, isLinux = is.Linux)
+  band1 <- bootstrapDiagram(location.subcloud, dtm, lim, by=resolution, maxdimension = 1, B=B, 
+                            alpha=alpha, dimension=1, parallel=T, weight=weight.boot,
+                            printProgress = T, m0=m.o)
   gc()
   
   df.PD <- grid.diag$diagram %>% .[,,drop=F] %>% as_tibble()
@@ -675,7 +682,7 @@ if(!is.Base){
   fineCommuneRes <- unlist(fineCommuneRes, recursive = FALSE)
 }
 
-# Stage 3:neighborhood level delineation.
+# Stage 3: neighborhood level delineation.
 cl.export <- c("searchOneSmallCup", "searchManySmallCups", "fluidTopoCup", "atVolume", "thresOptimLagrange")
 parCluster <- makeCluster(nCores)
 clusterEvalQ(parCluster, {library(raster); library(tidyverse); 
@@ -813,6 +820,9 @@ Shenzhen.utm <- spTransform(Shenzhen, CRSobj = crs.utm)
 subproblem.scale <- sapply(location, nrow)
 subproblem.scale
 
+# count of stay events per day
+date.counts <- location %>% map_dbl(~ transmute(., dt = date(t_start)) %>% n_distinct())
+psych::describe(subproblem.scale / date.counts)
 
 # rewrite the city level life circle `CityLevelLC` code, but modify small points:
 # - change the grid box spanning
@@ -1280,6 +1290,10 @@ communityTopo <- function(i){
   # draw the base map surrounding the community
   lc.basemap <- get_map(location = bbox.vect, zoom = 13, source = 'stadia', maptype = 'stamen_terrain')
   
+  # calculate a circular buffer for comparison
+  reside.centroid <- gCentroid(Reside) %>% spTransform(crs.utm)
+  shed.buffer.wgs <- gBuffer(reside.centroid, width=1000) %>% spTransform(crs.wgs)
+  
   # draw the coarse extent and stay events falling within
   # besides, community life circle and shape
   # cluster cores are pointed out in red triangles
@@ -1291,7 +1305,8 @@ communityTopo <- function(i){
     layer_spatial(Commune, alpha = 0.3) +
     layer_spatial(Reside, color="#444444", fill=NA, linetype='dashed') +
     scale_fill_scico(palette = "lajolla", na.value=NA) +
-    geom_point(aes(x=x, y=y), color='red', shape=17, size=2, data=dfCompo)
+    geom_point(aes(x=x, y=y), color='red', shape=17, size=2, data=dfCompo) + 
+    layer_spatial(shed.buffer.wgs, color='white', fill=NA, linetype='dashed', linewidth=2)
   
   # if there is a hole within the life circle, highlight it with blue dashed line.
   if(length(loop)) {
@@ -2115,4 +2130,261 @@ sapply(location.Points.Vis, nrow) %>% psych::describe()
 sapply(fineAnchorRes, function(x) {sum(sapply(x, function(y) length(y$repreCompo$cell)))}) %>% 
   psych::describe()
 
+# Sensitivity Analysis ----------------------------------------------------
+
+# Calculate the p-value and power
+
+# redefine the confidence level
+alpha <- 0.05
+# define a function to calculate the re-scaled standard deviation.
+calculate.sigma <- function(band, alpha) {
+  # the rejection test is two-sided
+  cum.p <- 1 - alpha / 2
+  # P(Z <= z) equals to cum.p
+  z <- qnorm(cum.p)
+  # calculate re-scaled std
+  sigma <- band / z
+  return(sigma)
+}
+
+# define a function to calculate the test power: 1 - beta.
+stat.power <- function(offset, alpha, stdev=1){
+  cut <- qnorm(1 - alpha/2, sd=stdev)
+  beta <- pnorm(cut, mean = offset, sd = stdev)
+  return(1 - beta)
+}
+
+# function to conduct stat inference to persistent diagram
+statTest <- function(life.circ){
+  # pick the signal with minimal lifespan
+  PD <- life.circ$gridDiag$diagram %>% .[,,drop=F] %>% as_tibble() %>% 
+    mutate(LifeHalf = (Death - Birth)/2)
+  
+  # rule to calculate p value:
+  #   if there's only one 0th homology: return NA
+  #   if there are more than one homology but only one is significant: return the longest lifetime of the insignificant ones.
+  #   if there are more than one significant homology: return the shortest life time of the significant ones.
+  life.thres.0th <- life.circ$band$zero
+  PD.zero <- PD %>% filter(dimension == 0)
+  if(nrow(PD.zero) < 2) sig.0th <- NA
+  else{
+    sigNum <- PD.zero %>% filter(LifeHalf > life.thres.0th) %>% nrow()
+    if(sigNum > 1) life.test.0th <- PD.zero %>% filter(LifeHalf > life.thres.0th) %>% 
+        summarise(LifeMin=min(LifeHalf)) %>% pull(LifeMin)
+    else life.test.0th <- PD.zero %>% filter(LifeHalf <= life.thres.0th) %>% 
+        summarise(LifeMax=max(LifeHalf)) %>% pull(LifeMax)
+    sig.0th <- 2 * (1 - pnorm(life.test.0th, sd=calculate.sigma(life.thres.0th, alpha)))
+  }
+  
+  # similar to the zeroth dimension
+  life.thres.1st <- life.circ$band$one
+  PD.one <- PD %>% filter(dimension == 1)
+  if(nrow(PD.one) < 1) sig.1st <- NA
+  else{
+    sigNum <- PD.one %>% filter(LifeHalf > life.thres.1st) %>% nrow()
+    if(sigNum > 0) life.test.1st <- PD.one %>% filter(LifeHalf > life.thres.1st) %>% 
+        summarise(LifeMin=min(LifeHalf)) %>% pull(LifeMin)
+    else life.test.1st <- PD.one %>% filter(LifeHalf <= life.thres.1st) %>% 
+        summarise(LifeMax=max(LifeHalf)) %>% pull(LifeMax)
+    sig.1st <- 2 * (1 - pnorm(life.test.1st, sd=calculate.sigma(life.thres.1st, alpha)))
+  }
+  
+  diagram.orig <- life.circ$gridDiag$diagram
+  diagram.base <- diagram.orig[1,,drop=FALSE]
+  # calculate the bottleneck distance as the proxy of the mean offset
+  effectsize.zero <- bottleneck(diagram.orig, diagram.base, dimension=0)
+  effectsize.one <- bottleneck(diagram.orig, diagram.base, dimension=1)
+  # 
+  power.zero <- stat.power(effectsize.zero, alpha, calculate.sigma(life.thres.0th, alpha))
+  power.one <- stat.power(effectsize.one, alpha, calculate.sigma(life.thres.1st, alpha))
+  return(list(p.0=sig.0th, p.1=sig.1st, power.0=power.zero, power.1=power.one))
+  }
+
+# convert the statistic test summary to dataframe
+significance.result <- lapply(fineCommuneRes, statTest) %>% 
+  {data.frame(
+    p.0 = sapply(., function(x) x$p.0),
+    p.1 = sapply(., function(x) x$p.1),
+    power.0 = sapply(., function(x) x$power.0),
+    power.1 = sapply(., function(x) x$power.1)    
+  )}
+
+
+
+# Spatial Resolution Robustness
+
+spatial.variation <- c(10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 800, 1000)
+
+bagualing.dorm <- fineCommuneRes$`05_BagualingDorm`
+fineRaster <- bagualing.dorm$rasterFine
+lim <- extent(fineRaster) %>% as.matrix(nrow=2) %>% t()
+grid <- coordinates(fineRaster)
+resolution <- ResoNeigh
+
+
+spatial.offset.spPtDf <- function(r, seed=5){
+  set.seed(seed)
+  spPtDf <- bagualing.dorm$subsetActs
+  n.points <- nrow(spPtDf)
+  radius <- r * sqrt(runif(n.points))
+  angle <- runif(n.points, 0, 2 * pi)
+  dx <- radius * cos(angle)
+  dy <- radius * sin(angle)
+  coords <- coordinates(spPtDf) + cbind(dx, dy) 
+  spPtDf.offset <- SpatialPointsDataFrame(
+    coords = coords, data = spPtDf@data, proj4string = spPtDf@proj4string
+  )
+  return(spPtDf.offset)
+}
+
+spPtDf.offset <- lapply(spatial.variation, spatial.offset.spPtDf)
+names(spPtDf.offset)<- paste0(spatial.variation, 'M')
+
+# calculate the bounding box in longitudes and latitudes
+coordsboxes <- lapply(CommuneCirc, function(x){point2wgs(t(as.matrix(bbox(x)))) %>% as.matrix() %>% t() %>% c()})
+# extract the basemap surround the Bagualing Dorm.
+lc.basemap <- get_map(location = coordsboxes$`05_BagualingDorm`, zoom = 13, source = 'stadia', maptype = 'stamen_terrain')
+# drawing function
+act.scatter.plotter.sensitivity <- function(act.df){
+  act.df.wgs <- spTransform(act.df, crs.wgs)
+  g <- ggmap(lc.basemap, alpha=0.9, darken = 0.6) +
+    layer_spatial(act.df.wgs, color='#8DEEEE', size=0.5, alpha=0.05) +
+    annotation_north_arrow(location='tr', style = north_arrow_fancy_orienteering) +
+    annotation_scale(location = "bl") +
+    xlab(NULL) + ylab(NULL)
+  return(g)
+}
+
+offset.vis <- lapply(spPtDf.offset, act.scatter.plotter.sensitivity)
+offset.vis
+
+Coarse2Fine4SenseAnalysis <- function(act.cloud.Df){
+  # extract the coordinates
+  act.coords <- act.cloud.Df@coords
+  
+  dtm.grid <- dtmBig(act.coords, grid, m.o, weight=1)
+  z.dtm <- matrix(dtm.grid, ncol=nrow(fineRaster), nrow=ncol(fineRaster))
+  raster.commune <- flip(raster(t(z.dtm)))
+  extent(raster.commune) <- extent(fineRaster)
+  crs(raster.commune) <- crs(fineRaster)
+  
+  # grid diag analysis
+  grid.diag <- gridDiag(act.coords, dtm, lim=lim, by=resolution, library = "Dionysus", 
+                        location = TRUE, printProgress=TRUE, m0=m.o)
+  gc()
+  # bands on the zero and first dimension
+  # note: change here to adapt to the linux system.
+  band0 <- bootstrapDiagram(act.coords, dtm, lim, by=resolution, maxdimension = 1, B=B, 
+                               alpha=alpha, dimension=0, parallel=F, printProgress = T, m0=m.o)
+  gc()
+  band1 <- bootstrapDiagram(act.coords, dtm, lim, by=resolution, maxdimension = 1, B=B, 
+                               alpha=alpha, dimension=1, parallel=F, printProgress = T, m0=m.o)
+  gc()
+  
+  df.PD <- grid.diag$diagram %>% .[,,drop=F] %>% as_tibble()
+  if(all(df.PD$dimension == 0)) band1prime <- NULL else band1prime <- band1
+  df.PDim <- df.PD %>% mutate(Lifetime = Death-Birth, rn=row_number()) %>% group_by(dimension) %>% nest()
+  # filter out the not significant signals.
+  df.PD.reduce <- df.PDim %>% ungroup() %>%  mutate(data = map2(data, 2*c(band0, band1prime), ~filter(.x, Lifetime > .y))) %>% unnest(cols=c(data))
+  
+  # representative component (topological clusters)
+  beta.0.idx <- df.PD.reduce %>% filter(dimension==0) %>% .$rn
+  
+  if(!is.vector(grid.diag$birthLocation))
+    beta.0.loc <- grid.diag$birthLocation[beta.0.idx, , drop=FALSE]
+  else beta.0.loc <- matrix(grid.diag$birthLocation, nrow = 1)
+  cellID <- cellFromXY(raster.commune, beta.0.loc)
+  
+  # representative loop (cavities)
+  beta.1.idx <- df.PD.reduce %>% filter(dimension==1) %>% .$rn
+  beta.1.loop <- grid.diag$cycleLocation[beta.1.idx]
+  sigLoops <- beta.1.loop
+  
+  return(list(topoSignal=df.PD.reduce, rasterFine=raster.commune, m.o=m.o, repreCompo=list(cell=cellID, xy=beta.0.loc), 
+              repreLoop=sigLoops, band=list(zero=band0, one=band1), gridDiag=grid.diag, subsetAct=act.cloud.Df))
+  }
+
+cl.export <- c("dtmBig", "grid", "m.o", "fineRaster", "bootstrapDiagramBig", 
+               "resolution", "lim", "batchPartition", "B", "alpha", 
+               "BatchSize", "is.Linux", "Coarse2Fine4SenseAnalysis")
+parCluster <- makeCluster(nCores)
+clusterEvalQ(parCluster, {library(TDA); library(raster); library(tidyverse); 
+  library(rgeos)})
+clusterEvalQ(parCluster, sink(paste0("./parallel_log/logging_", Sys.getpid(), ".txt")))
+clusterExport(parCluster, cl.export)
+tryCatch(
+  {fineCommuneResSense <- parLapplyLB(parCluster, spPtDf.offset, safeWrapper(Coarse2Fine4SenseAnalysis))},
+  finally = {save(fineCommuneResSense, file='./fineCommuneResSense.RData'); stopCluster(parCluster)})
+
+
+cl.export <- c("searchOneSmallCup", "searchManySmallCups", "fluidTopoCup", "atVolume", "thresOptimLagrange", "Commune2Circ")
+parCluster <- makeCluster(nCores)
+clusterEvalQ(parCluster, {library(raster); library(tidyverse); 
+  library(Rsolnp)})
+clusterEvalQ(parCluster, sink(paste0("./parallel_log/logging_", Sys.getpid(), ".txt")))
+clusterExport(parCluster, cl.export)
+tryCatch(
+  {CommuneCircSense <- parLapplyLB(parCluster, fineCommuneResSense, safeWrapper(Commune2Circ), Target=SurplusConstant)},
+  finally = {save(CommuneCircSense, file='./CommuneCircSense.RData'); stopCluster(parCluster)})
+
+
+load('./image_result/new_result/fineCommuneResSense.RData')
+load('./image_result/new_result/CommuneCircSense.RData')
+
+CommuneCircSense <- lapply(CommuneCircSense, flip)
+
+# visualization of the 
+communitySense <- function(i){
+  
+  fineRes <- fineCommuneResSense[[i]]
+  Commune <- CommuneCircSense[[i]]
+
+  compo.loc <- fineRes$repreCompo$xy
+  loop <- fineRes$repreLoop
+  dfCompo <- point2wgs(compo.loc)
+  # draw the base map surrounding the community
+
+  # draw the coarse extent and stay events falling within
+  # besides, community life circle and shape
+  # cluster cores are pointed out in red triangles
+  g <- ggmap(lc.basemap, darken = 0.7) +
+    layer_spatial(spTransform(fineRes$subsetAct, crs.wgs),
+                  color='#8DEEEE', size=0.2, alpha=0.1) +
+    layer_spatial(Commune, alpha = 0.3) +
+    scale_fill_scico(palette = "lajolla", na.value=NA) +
+    geom_point(aes(x=x, y=y), color='red', shape=17, size=2, data=dfCompo)
+
+  # if there is a hole within the life circle, highlight it with blue dashed line.
+  if(length(loop)) {
+    dfLoop <- lapply(loop, function(arr){data.frame(x=arr[,1,1], y=arr[,1,2], xend=arr[,2,1], yend=arr[,2,2])}) %>% reduce(rbind)
+    dfLoop <- cbind(point2wgs(dfLoop[,c(1,2)]), point2wgs(dfLoop[,c(3,4)]))
+    colnames(dfLoop) <- c('x', 'y', 'xend', 'yend')
+    g <- g + geom_segment(aes(x=x, y=y, xend=xend, yend=yend), color="blue", size=1.5, 
+                          linejoin='round', linetype='dotted', data = dfLoop)
+  }  
+  
+  # other attachments and decorattions.
+  g <- g + annotation_north_arrow(location='tr', style = north_arrow_fancy_orienteering) +
+    annotation_scale(location = "bl") +
+    xlab(NULL) + ylab(NULL)+
+    theme(axis.text.x = element_text(angle=45, hjust=1)) +
+    guides(fill="none")
+  return(g)
+}
+
+lc.draw <- lapply(seq_along(fineCommuneResSense), communitySense)
+names(lc.draw) <- names(fineCommuneResSense)
+save(lc.draw, file='./image_result/community_sensitivity.RData')
+
+# draw life circles on all communities.
+for(commune.nom in names(lc.draw)){
+  plot(lc.draw[[commune.nom]])
+  ggsave(paste0('./product/annals_visualization/Communes_LifeCircle_sensitivity/', commune.nom, '.png'), 
+         width = 7, height = 7, dpi=300)
+  dev.off()
+}
+
+
 # Sketch Area -------------------------------------------------------------
+
+fine.res.bagua <- City2Commune(cityLevelLCRes$`05_BagualingDorm`, location.Points$`05_BagualingDorm`, m.o = m.o, base = TRUE)
